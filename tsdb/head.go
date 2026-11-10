@@ -61,6 +61,10 @@ var (
 	// ErrAppenderClosed is returned if an appender has already be successfully
 	// rolled back or committed.
 	ErrAppenderClosed = errors.New("appender closed")
+	// ErrWALReplayCancelled is returned when WAL replay is interrupted by a
+	// stop signal (e.g. SIGTERM). The incomplete replay is harmless because the
+	// on-disk WAL is not modified and will be replayed again on the next start.
+	ErrWALReplayCancelled = errors.New("WAL replay cancelled")
 
 	// defaultIsolationDisabled is true if isolation is disabled by default.
 	defaultIsolationDisabled = false
@@ -158,6 +162,14 @@ type Head struct {
 	// For running the background goroutine which updates series_state.json.
 	seriesStateQuit chan struct{}
 	seriesStateWg   sync.WaitGroup
+
+	// stopc, when non-nil and closed, signals WAL replay to abort immediately.
+	stopc <-chan struct{}
+
+	// walReplayComplete reports whether Init replayed the whole WAL. A chunk
+	// snapshot is named after the end of the WAL, so snapshotting a head that
+	// stopped short makes the next startup skip the records it never replayed.
+	walReplayComplete atomic.Bool
 
 	stats *HeadStats
 	reg   prometheus.Registerer
@@ -262,6 +274,10 @@ type HeadOptions struct {
 
 	// EnableFastStartup enables scraping in parallel with WAL replay but with queries still disabled.
 	EnableFastStartup bool
+
+	// WALReplayInterruptCh, when non-nil and closed, causes WAL replay to
+	// abort immediately and return ErrWALReplayCancelled.
+	WALReplayInterruptCh <-chan struct{}
 }
 
 const (
@@ -355,6 +371,7 @@ func NewHead(r prometheus.Registerer, l *slog.Logger, wal, wbl *wlog.WL, opts *H
 		stats:           stats,
 		reg:             r,
 		seriesStateQuit: make(chan struct{}),
+		stopc:           opts.WALReplayInterruptCh,
 	}
 	if err := h.resetInMemoryState(); err != nil {
 		return nil, err
@@ -771,10 +788,23 @@ func (s *WALReplayStatus) GetWALReplayStatus() WALReplayStatus {
 
 const cardinalityCacheExpirationTime = time.Duration(30) * time.Second
 
+func (h *Head) replayStopped() bool {
+	if h.stopc == nil {
+		return false
+	}
+	select {
+	case <-h.stopc:
+		return true
+	default:
+		return false
+	}
+}
+
 // Init loads data from the write ahead log and prepares the head for writes.
 // It should be called before using an appender so that it
 // limits the ingested samples to the head min valid time.
 func (h *Head) Init(minValidTime int64) error {
+	h.walReplayComplete.Store(false)
 	h.minValidTime.Store(minValidTime)
 	defer h.resetWLReplayResources()
 	defer func() {
@@ -879,7 +909,12 @@ func (h *Head) Init(minValidTime int64) error {
 
 	if h.wal == nil {
 		h.logger.Info("WAL not found")
+		h.walReplayComplete.Store(true)
 		return nil
+	}
+
+	if h.replayStopped() {
+		return ErrWALReplayCancelled
 	}
 
 	h.logger.Info("Replaying WAL, this may take a while")
@@ -1023,6 +1058,8 @@ func (h *Head) Init(minValidTime int64) error {
 		"mmap_chunk_replay_duration", mmapChunkReplayDuration.String(),
 		"total_replay_duration", totalReplayDuration.String(),
 	)
+
+	h.walReplayComplete.Store(true)
 
 	// TODO(RushabhMehta2005): Remove this 'if' block and always run the series state ticker when the feature is fully implemented.
 	if h.opts.EnableFastStartup {
@@ -2320,7 +2357,14 @@ func (h *Head) Close() error {
 		errs = errors.Join(errs, h.wbl.Close())
 	}
 	if errs == nil && h.opts.EnableMemorySnapshotOnShutdown {
-		errs = errors.Join(errs, h.performChunkSnapshot())
+		if h.walReplayComplete.Load() {
+			errs = errors.Join(errs, h.performChunkSnapshot())
+		} else {
+			// Snapshotting here would persist a head holding only part of the WAL
+			// under a name claiming it covers all of it, so the next startup would
+			// skip the records that were never replayed.
+			h.logger.Warn("Skipping chunk snapshot on shutdown, the WAL was not fully replayed")
+		}
 	}
 	return errs
 }

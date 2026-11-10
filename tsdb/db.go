@@ -298,6 +298,12 @@ type Options struct {
 
 	// EnableFastStartup enables scraping in parallel with WAL replay but with queries still disabled.
 	EnableFastStartup bool
+
+	// WALReplayInterruptCh, when closed, causes WAL replay to abort
+	// immediately and return ErrWALReplayCancelled. This allows a process
+	// that receives SIGTERM during startup to exit without waiting for a
+	// potentially hours-long WAL replay to complete.
+	WALReplayInterruptCh <-chan struct{}
 }
 
 type NewCompactorFunc func(ctx context.Context, r prometheus.Registerer, l *slog.Logger, ranges []int64, pool chunkenc.Pool, opts *Options) (Compactor, error)
@@ -1185,6 +1191,7 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	headOpts.EnableHistogramSTEncoding.Store(opts.EnableHistogramSTEncoding)
 	headOpts.EnableMetadataWALRecords = opts.EnableMetadataWALRecords
 	headOpts.EnableFastStartup = opts.EnableFastStartup
+	headOpts.WALReplayInterruptCh = opts.WALReplayInterruptCh
 	if opts.WALReplayConcurrency > 0 {
 		headOpts.WALReplayConcurrency = opts.WALReplayConcurrency
 	}
@@ -1240,6 +1247,10 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 	}
 
 	if initErr := db.head.Init(minValidTime); initErr != nil {
+		if errors.Is(initErr, ErrWALReplayCancelled) {
+			// The failed-startup cleanup does not reach an existing head.
+			return nil, errors.Join(initErr, db.head.Close())
+		}
 		db.head.metrics.walCorruptionsTotal.Inc()
 		if e, ok := errors.AsType[*errLoadWbl](initErr); ok {
 			db.logger.Warn("Encountered WBL read error, attempting repair", "err", initErr)

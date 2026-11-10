@@ -1545,6 +1545,8 @@ func main() {
 		// TSDB.
 		opts := cfg.tsdb.ToTSDBOptions()
 		cancel := make(chan struct{})
+		walReplayInterrupt := make(chan struct{})
+		opts.WALReplayInterruptCh = walReplayInterrupt
 		g.Add(
 			func() error {
 				logger.Info("Starting TSDB ...")
@@ -1561,6 +1563,10 @@ func main() {
 
 				db, err := openDBWithMetrics(localStoragePath, logger, prometheus.DefaultRegisterer, &opts, localStorage.getStats())
 				if err != nil {
+					if errors.Is(err, tsdb.ErrWALReplayCancelled) {
+						logger.Info("WAL replay cancelled, shutting down")
+						return nil
+					}
 					return fmt.Errorf("opening storage failed: %w", err)
 				}
 
@@ -1596,6 +1602,7 @@ func main() {
 			},
 			func(error) {
 				logger.Info("Stopping storage...")
+				close(walReplayInterrupt)
 				if err := fanoutStorage.Close(); err != nil {
 					logger.Error("Error stopping storage", "err", err)
 				}

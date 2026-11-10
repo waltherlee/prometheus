@@ -1928,6 +1928,7 @@ func TestChunkSnapshot_AppenderV2(t *testing.T) {
 		t.Run("enableSTStorage="+strconv.FormatBool(enableSTStorage), func(t *testing.T) {
 			t.Parallel()
 			head, _ := newTestHead(t, 120*4, compression.None, false)
+			require.NoError(t, head.Init(math.MinInt64))
 			defer func() {
 				head.opts.EnableMemorySnapshotOnShutdown = false
 				require.NoError(t, head.Close())
@@ -2224,6 +2225,7 @@ func TestChunkSnapshot_AppenderV2(t *testing.T) {
 
 func TestSnapshotError_AppenderV2(t *testing.T) {
 	head, _ := newTestHead(t, 120*4, compression.None, false)
+	require.NoError(t, head.Init(math.MinInt64))
 	defer func() {
 		head.opts.EnableMemorySnapshotOnShutdown = false
 		require.NoError(t, head.Close())
@@ -3671,6 +3673,7 @@ func TestGaugeFloatHistogramWALAndChunkHeader_AppenderV2(t *testing.T) {
 
 func TestSnapshotAheadOfWALError_AppenderV2(t *testing.T) {
 	head, _ := newTestHead(t, 120*4, compression.None, false)
+	require.NoError(t, head.Init(math.MinInt64))
 	head.opts.EnableMemorySnapshotOnShutdown = true
 	// Add a sample to fill WAL.
 	app := head.AppenderV2(context.Background())

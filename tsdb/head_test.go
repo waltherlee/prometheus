@@ -955,6 +955,33 @@ func TestHead_ReadWAL(t *testing.T) {
 	}
 }
 
+func TestHead_WALReplayCancellation(t *testing.T) {
+	stopc := make(chan struct{})
+	close(stopc)
+
+	opts := newTestHeadDefaultOptions(1000, false)
+	opts.WALReplayInterruptCh = stopc
+	head, w := newTestHeadWithOptions(t, compression.None, opts)
+	defer func() {
+		require.NoError(t, head.Close())
+	}()
+
+	entries := []any{
+		[]record.RefSeries{
+			{Ref: 10, Labels: labels.FromStrings("a", "1")},
+			{Ref: 11, Labels: labels.FromStrings("a", "2")},
+		},
+		[]record.RefSample{
+			{Ref: 10, T: 100, V: 2},
+			{Ref: 11, T: 100, V: 3},
+		},
+	}
+	populateTestWL(t, w, entries, nil, false)
+
+	err := head.Init(math.MinInt64)
+	require.ErrorIs(t, err, ErrWALReplayCancelled)
+}
+
 // TestHead_WALMultiRef_StaleDeletion_ChunkGaugeNotNegative is a regression test
 // for https://github.com/prometheus/prometheus/issues/10884.
 //
@@ -3381,6 +3408,7 @@ func TestQueryOOOHeadDuringTruncate(t *testing.T) {
 // to full WAL replay, recovering all series without data loss.
 func TestSnapshotUnknownEncodingFallsBackToWAL(t *testing.T) {
 	head, _ := newTestHead(t, 120*4, compression.None, false)
+	require.NoError(t, head.Init(math.MinInt64))
 	defer func() {
 		head.opts.EnableMemorySnapshotOnShutdown = false
 		require.NoError(t, head.Close())

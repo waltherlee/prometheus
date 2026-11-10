@@ -84,6 +84,76 @@ func TestDataAvailableOnlyAfterCommit_AppendV2(t *testing.T) {
 	require.Equal(t, map[string][]chunks.Sample{`{foo="bar"}`: {sample{t: 0, f: 0}}}, seriesSet)
 }
 
+func TestOpenInterruptedDuringWALReplay(t *testing.T) {
+	db := newTestDB(t)
+
+	app := db.AppenderV2(context.Background())
+	for i := range 100 {
+		_, err := app.Append(0, labels.FromStrings("foo", strconv.Itoa(i)), 0, 100, float64(i), nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+	dbDir := db.Dir()
+	require.NoError(t, db.Close())
+
+	// Re-open with an already-closed interrupt channel to simulate SIGTERM arriving
+	// before WAL replay starts.
+	interruptCh := make(chan struct{})
+	close(interruptCh)
+
+	opts := DefaultOptions()
+	opts.WALReplayInterruptCh = interruptCh
+	_, err := Open(dbDir, nil, nil, opts, nil)
+	require.ErrorIs(t, err, ErrWALReplayCancelled)
+}
+
+// TestInterruptedWALReplayDoesNotSnapshot ensures a cancelled WAL replay leaves no
+// chunk snapshot behind. Such a snapshot would be named after the WAL's end position
+// while holding only the part of it that had been replayed, so the next startup would
+// resume from the end and silently skip everything in between.
+func TestInterruptedWALReplayDoesNotSnapshot(t *testing.T) {
+	dir := t.TempDir()
+
+	opts := DefaultOptions()
+	db, err := Open(dir, nil, nil, opts, nil)
+	require.NoError(t, err)
+
+	app := db.AppenderV2(context.Background())
+	for i := range 100 {
+		_, err := app.Append(0, labels.FromStrings("foo", strconv.Itoa(i)), 0, 100, float64(i), nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+	}
+	require.NoError(t, app.Commit())
+	require.NoError(t, db.Close())
+
+	// Reopen with snapshotting enabled and an already closed interrupt channel, to
+	// simulate a SIGTERM arriving during WAL replay.
+	interruptCh := make(chan struct{})
+	close(interruptCh)
+
+	opts = DefaultOptions()
+	opts.EnableMemorySnapshotOnShutdown = true
+	opts.WALReplayInterruptCh = interruptCh
+	_, err = Open(dir, nil, nil, opts, nil)
+	require.ErrorIs(t, err, ErrWALReplayCancelled)
+
+	_, _, _, err = LastChunkSnapshot(dir)
+	require.ErrorIs(t, err, record.ErrNotFound, "snapshot written for a partially replayed head")
+
+	// The whole WAL must still be replayed on the next startup.
+	opts = DefaultOptions()
+	opts.EnableMemorySnapshotOnShutdown = true
+	db, err = Open(dir, nil, nil, opts, nil)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, db.Close())
+	}()
+
+	querier, err := db.Querier(0, 200)
+	require.NoError(t, err)
+	require.Len(t, query(t, querier, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".*")), 100)
+}
+
 // TestNoPanicAfterWALCorruption_AppendV2 ensures that querying the db after a WAL corruption doesn't cause a panic.
 // https://github.com/prometheus/prometheus/issues/7548
 func TestNoPanicAfterWALCorruption_AppendV2(t *testing.T) {

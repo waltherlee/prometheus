@@ -163,6 +163,9 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 		var err error
 		dec := record.NewDecoder(syms, h.logger)
 		for r.Next() {
+			if h.replayStopped() {
+				return
+			}
 			switch dec.Type(r.Record()) {
 			case record.Series:
 				series := h.wlReplaySeriesPool.Get()[:0]
@@ -259,6 +262,9 @@ func (h *Head) loadWAL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 	missingSeries := make(map[chunks.HeadSeriesRef]struct{})
 Outer:
 	for d := range decoded {
+		if h.replayStopped() {
+			break Outer
+		}
 		switch v := d.(type) {
 		case []record.RefSeries:
 			for _, walSeries := range v {
@@ -484,6 +490,16 @@ Outer:
 	}
 	unknownSeriesRefs.merge(missingSeries)
 
+	if h.replayStopped() {
+		for range decoded {
+		}
+		for i := range concurrency {
+			processors[i].closeAndDrain()
+		}
+		close(exemplarsInput)
+		wg.Wait()
+		return ErrWALReplayCancelled
+	}
 	if decodeErr != nil {
 		return decodeErr
 	}
@@ -958,6 +974,9 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 		defer close(decodedCh)
 		dec := record.NewDecoder(syms, h.logger)
 		for r.Next() {
+			if h.replayStopped() {
+				return
+			}
 			var err error
 			rec := r.Record()
 			switch dec.Type(rec) {
@@ -1020,7 +1039,12 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 	// References that this WBL resolves through multiRef. Their series records
 	// must stay in the WAL after the next checkpoint. See pinWBLSeriesRefs.
 	pinnedSeries := make(map[chunks.HeadSeriesRef]struct{})
+	cancelled := false
 	for d := range decodedCh {
+		if h.replayStopped() {
+			cancelled = true
+			break
+		}
 		switch v := d.(type) {
 		case []record.RefSample:
 			samples := v
@@ -1146,6 +1170,15 @@ func (h *Head) loadWBL(r *wlog.Reader, syms *labels.SymbolTable, multiRef map[ch
 	unknownSeriesRefs.merge(missingSeries)
 	h.pinWBLSeriesRefs(pinnedSeries)
 
+	if cancelled {
+		for range decodedCh {
+		}
+		for i := range concurrency {
+			processors[i].closeAndDrain()
+		}
+		wg.Wait()
+		return ErrWALReplayCancelled
+	}
 	if decodeErr != nil {
 		return decodeErr
 	}
@@ -1493,6 +1526,11 @@ func (h *Head) ChunkSnapshot() (*ChunkSnapshotStats, error) {
 		// If we are not storing any WAL, does not make sense to take a snapshot too.
 		h.logger.Warn("skipping chunk snapshotting as WAL is disabled")
 		return &ChunkSnapshotStats{}, nil
+	}
+	if !h.walReplayComplete.Load() {
+		// The snapshot records the WAL's end position as the offset to resume
+		// replay from, which is only true for a head that replayed all of it.
+		return &ChunkSnapshotStats{}, errors.New("cannot snapshot a head that has not completed WAL replay")
 	}
 	h.chunkSnapshotMtx.Lock()
 	defer h.chunkSnapshotMtx.Unlock()
